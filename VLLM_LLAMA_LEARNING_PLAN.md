@@ -95,19 +95,45 @@ uv pip install -e . --no-build-isolation
 
 #### 1.1 第一个可运行示例
 
+**⚠️ 模型选择说明：**
+
+学习 vLLM 推理**强烈建议使用 LLaMA 架构的模型**，原因：
+- vLLM 核心实现（`llama.py`）是最标准、最完整的参考
+- PagedAttention、RoPE、SwiGLU 等核心技术都以 LLaMA 为原型
+- 其他模型都是在 LLaMA 基础上修改的，学习路径最清晰
+
+**推荐模型（按优先级）：**
+
+| 模型 | 大小 | 优势 | 是否需要授权 |
+|------|------|------|--------------|
+| **TinyLlama/TinyLlama-1.1B-Chat-v1.0** | 1.1GB | ✅ 完整 LLaMA 架构<br>✅ 代码直接对应 `llama.py`<br>✅ 学习价值最高 | ❌ 无需 |
+| meta-llama/Llama-3.2-1B-Instruct | 1.2GB | ✅ 官方 LLaMA<br>⚠️ 需要申请权限 | ✅ 需要 |
+| Qwen/Qwen2.5-0.5B-Instruct | 1GB | ✅ 架构相似<br>✅ 中文支持好 | ❌ 无需 |
+| facebook/opt-125m | 500MB | ⚠️ 非 LLaMA 架构<br>✅ 体积最小 | ❌ 无需 |
+
 创建 `my_debug_scripts/step1_basic_llama.py`：
 
 ```python
 from vllm import LLM, SamplingParams
 
-# 使用小模型快速验证
-model_name = "meta-llama/Llama-3.2-1B-Instruct"  # 或使用本地路径
+# 使用 LLaMA 架构的小模型（推荐用于学习）
+model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # 完整 LLaMA 架构，无需授权
+
+# 如果已有 meta-llama 授权，可以使用：
+# model_name = "meta-llama/Llama-3.2-1B-Instruct"
+
+# 或使用本地下载的模型：
+# model_name = "/path/to/your/llama-model"
 
 # 创建LLM实例
 llm = LLM(
     model=model_name,
     tensor_parallel_size=1,  # 先用单卡
-    gpu_memory_utilization=0.5,
+    gpu_memory_utilization=0.3,  # 控制KV Cache预分配比例（0.3=占用30%显存）
+                                  # 多进程可共享GPU，只要总显存不超限
+                                  # 情况1: GPU独占 → 可设0.9（高吞吐）
+                                  # 情况2: 多进程共享 → 设0.3-0.5（为其他进程留空间）
+                                  # 情况3: 显存紧张 → 配合kv_cache_dtype="int8"量化
     max_model_len=2048,
     trust_remote_code=True
 )
@@ -122,10 +148,27 @@ for output in outputs:
     print(f"Output: {output.outputs[0].text}\n")
 ```
 
+**运行方式：**
+
+```bash
+# 方式1: 使用 VSCode 调试（推荐）
+# 按 F5，选择 "🚀 Step1: 基础 LLaMA 推理"
+
+# 方式2: 命令行运行
+python my_debug_scripts/step1_basic_llama.py
+
+# 方式3: 指定 GPU（避免冲突）
+CUDA_VISIBLE_DEVICES=1 python my_debug_scripts/step1_basic_llama.py
+
+# 查看 GPU 占用情况
+nvidia-smi
+```
+
 **调试任务：**
 1. 在 `vllm/__init__.py` 的 `LLM.__init__()` 设置断点
 2. 跟踪模型加载过程：`vllm/model_executor/models/llama.py` 中的 `LlamaForCausalLM` 类
 3. 理解关键组件初始化顺序
+4. 观察 TinyLlama 如何复用标准 LLaMA 实现
 
 #### 1.2 核心代码跟踪路径
 
@@ -568,11 +611,13 @@ logger.warning("Warning message")
 ## 六、进度跟踪清单
 
 ### Week 1-2: 基础入门
-- [ ] 环境搭建完成
-- [ ] 运行第一个LLaMA推理示例
-- [ ] 理解LLM类的初始化流程
-- [ ] 追踪完整的token生成过程
-- [ ] 阅读`llama.py`核心代码
+- [ ] 环境搭建完成（uv venv + python3-dev）
+- [ ] 选择合适的学习模型（推荐 TinyLlama）
+- [ ] 配置 VSCode 调试环境（.vscode/launch.json）
+- [ ] 运行第一个 LLaMA 推理示例
+- [ ] 理解 LLM 类的初始化流程
+- [ ] 追踪完整的 token 生成过程
+- [ ] 阅读 `llama.py` 核心代码，理解架构对应关系
 
 ### Week 3-4: PagedAttention
 - [ ] 理解PagedAttention原理
@@ -619,16 +664,138 @@ logger.warning("Warning message")
 
 ## 八、常见问题速查
 
-### Q1: 显存溢出 (OOM)
+### Q1: 显存溢出 (OOM) 或与其他进程冲突
+
+**显存占用计算公式：**
+```
+总显存 = 模型权重 + KV Cache + 激活值 + 框架开销
+
+1. 模型权重（固定）
+   = 参数量 × 精度字节数
+   TinyLlama: 1.1B × 2 bytes(FP16) = 2.2GB
+
+2. KV Cache（可调，最大头）
+   【公式详解】每层每个token的KV存储：
+   单token单层 = 2(K+V) × num_kv_heads × head_dim × 精度(字节)
+   
+   参数含义：
+   - 2(K+V): Attention需要缓存Key和Value两个矩阵
+   - num_kv_heads: KV的注意力头数量
+     * MHA(多头注意力): num_kv_heads = num_q_heads (如32头)
+     * GQA(分组查询): num_kv_heads < num_q_heads (如4头KV对应32头Q)
+     * MQA(多查询): num_kv_heads = 1 (极致显存优化)
+   - head_dim: 每个头的维度 (通常64或128)
+     计算: hidden_size / num_q_heads
+     如TinyLlama: 2048 / 32 = 64
+   - 精度: 数据类型字节数
+     * FP16/BF16: 2字节
+     * INT8: 1字节 (量化后)
+     * FP32: 4字节
+   
+   【TinyLlama示例】
+   配置: 32层, 32个Q头, 4个KV头(GQA), head_dim=64, FP16
+   单token单层 = 2 × 4 × 64 × 2 = 1024字节 = 1KB
+   总KV预留 = num_layers × 单层KV × max_model_len × max_num_seqs
+   
+   参数详解：
+   - num_layers (32层): Transformer解码器层数
+     每层都有独立的Attention，需要独立的KV Cache
+     可查看config.json: "num_hidden_layers": 32
+   
+   - max_model_len (2048): 单个序列的最大token长度
+     = prompt长度 + 生成的output长度
+     
+     ❓ Token是什么？
+     Token是模型的基本处理单元，由Tokenizer算法切分（不是简单的"词"）
+     
+     英文Tokenization（接近单词，但不完全是）:
+     * 常见词: "hello" = 1 token ✓
+     * 长词拆分: "running" = "run" + "ning" = 2 tokens
+     * 罕见词: "ChatGPT" 可能被拆成 "Chat" + "G" + "PT"
+     * 标点空格: ", " "." 也是token
+     * 换算: ~1个单词 ≈ 1.3 tokens（平均）
+     
+     中文Tokenization（❌ 不是按词语切分！）:
+     * LLaMA用字节级BPE，未对中文优化
+     * 每个汉字的UTF-8编码（3字节）被拆成多个token片段
+     * "你好"(2字) ≈ 4-6 tokens（不是1个词=1个token）
+     * "人工智能"(4字) ≈ 8-12 tokens
+     * 换算: ~1个汉字 ≈ 1.5-2 tokens
+     
+     ✅ 实际测试方法：
+     ```python
+     from transformers import AutoTokenizer
+     tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+     text = "Hello world, 你好世界"
+     tokens = tokenizer.encode(text)
+     print(f"文本: {text}")
+     print(f"Token数: {len(tokens)}")  # 实际token数量
+     print(f"Tokens: {tokens}")
+     ```
+     
+     使用示例:
+     - 用户输入: "写一篇关于AI的文章"(~15 tokens)
+     - 模型生成: 500字英文(~125 tokens) 或 500汉字(~750 tokens)
+     - 总计: 140 或 765 tokens < 2048 ✅ 可以处理
+     
+     ⚠️ 设太大浪费显存，设太小会截断长文本
+   
+   - max_num_seqs (256): 最大并发序列数 = batch size
+     同时处理多少个不同的请求
+     例: 256个用户同时发送请求，vLLM可以一起处理
+     ⚠️ 越大吞吐量越高，但显存需求成倍增加！
+   
+   实际计算:
+   KV Cache = 32层 × 1KB × 2048 tokens × 256并发 ≈ 16GB (理论最大)
+   
+   ⚠️ gpu_memory_utilization 工作机制：
+   显存分配顺序：
+   1. 先加载模型权重（2.2GB）         → 占用GPU显存
+   2. 框架初始化开销（~1GB）          → 占用GPU显存  
+   3. 计算剩余可用显存: 24GB - 3.2GB = 20.8GB
+   4. KV Cache预分配: 20.8GB × 0.3 = 6.24GB → 占用GPU显存
+   5. 激活值动态分配（几百MB）        → 占用GPU显存
+   
+   ✅ 所有内存都在GPU上！gpu_memory_utilization只控制KV Cache
+   设为0.3: 限制KV Cache最多占用(剩余显存×30%)
+   设为0.9: KV Cache可用(剩余显存×90%)，为激活值留10%
+
+3. 激活值（动态）
+   = batch_size × seq_len × hidden_size × 层数 × 精度
+   通常几百MB到几GB
+
+4. 框架开销: PyTorch/CUDA占用约1-2GB
+```
+
+**实际显存需求示例（TinyLlama）：**
+| 配置 | 模型权重 | KV Cache预分配 | 其他 | 总计 |
+|------|----------|----------------|------|------|
+| `gpu_memory_utilization=0.9` | 2.2GB | 21.6GB | 1GB | ~24.8GB ❌ 单进程 |
+| `gpu_memory_utilization=0.3` | 2.2GB | 7.2GB | 1GB | ~10.4GB ✅ 可共享 |
+| `gpu_memory_utilization=0.3`<br>`+ kv_cache_dtype="int8"` | 2.2GB | 3.6GB | 1GB | ~6.8GB ✅ 更省 |
+
+```bash
+# 查看 GPU 使用情况
+nvidia-smi
+ps aux | grep -E "python.*vllm|vllm.*serve" | grep -v grep
+
+# 指定使用其他 GPU
+export CUDA_VISIBLE_DEVICES=1  # 使用 GPU 1
+python my_debug_scripts/step1_basic_llama.py
+```
+
 ```python
-# 降低gpu_memory_utilization
-llm = LLM(model=..., gpu_memory_utilization=0.7)  # 默认0.9
+# 方案1: 降低KV Cache预分配
+llm = LLM(model=..., gpu_memory_utilization=0.3)  # 7.2GB KV Cache
 
-# 减少max_num_seqs
-llm = LLM(model=..., max_num_seqs=64)  # 降低并发
+# 方案2: 减少并发序列数
+llm = LLM(model=..., max_num_seqs=64)  # 从256降到64
 
-# 使用KV cache量化
-llm = LLM(model=..., kv_cache_dtype="int8")
+# 方案3: 缩短最大序列长度
+llm = LLM(model=..., max_model_len=1024)  # 从2048降到1024
+
+# 方案4: KV Cache量化（显存减半）
+llm = LLM(model=..., kv_cache_dtype="int8")  # FP16→INT8
 ```
 
 ### Q2: 多卡不均衡
