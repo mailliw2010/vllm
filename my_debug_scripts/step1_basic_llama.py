@@ -13,44 +13,21 @@ import sys
 # vLLM v1 默认启用多进程引擎：主进程依赖后台线程与子进程通信。
 # 若你在主进程打断点并单步，这些通信线程会被暂停，容易出现“卡住”的假象。
 # 调试时默认切到单进程模式，避免子进程继续跑而主进程线程暂停造成的死锁。
-if sys.gettrace() is not None and os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING") is None:
+# 说明：debugpy 在启动早期不一定已经设置 sys.settrace()，所以同时检查 VSCode/debugpy 环境变量。
+_is_debug_session = (
+    sys.gettrace() is not None
+    or os.getenv("DEBUGPY_LAUNCHER_PORT") is not None
+    or os.getenv("VSCODE_PID") is not None
+)
+if _is_debug_session and os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING") is None:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 from vllm import LLM, SamplingParams
 
-def _configure_script_logger() -> logging.Logger:
-    """为当前脚本配置日志。
-
-    说明：VSCode/debugpy 单步时，如果后台线程暂停在写 stdout/stderr，
-    当前线程再写同一 stream 可能被 TextIO 的锁卡住。调试时把本脚本日志
-    单独写入文件，避免与 vLLM 的控制台日志竞争同一把 I/O 锁。
-    """
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-
-    if sys.gettrace() is None:
-        logging.basicConfig(level=logging.DEBUG)
-        return logger
-
-    # 调试器存在：脚本日志写文件，避免卡在 logger.info()
-    from pathlib import Path
-
-    log_dir = Path(__file__).resolve().parent / ".logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "step1_basic_llama.debug.log"
-
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.propagate = False
-    return logger
-
-
-logger = _configure_script_logger()
+# 配置日志（使用标准 logging；不依赖 vLLM 的 init_logger）
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 def _avoid_vscode_step_deadlock_for_logging() -> None:
     """避免 VSCode 单步调试时，因多线程日志锁导致卡在 logger.info()。
@@ -59,7 +36,7 @@ def _avoid_vscode_step_deadlock_for_logging() -> None:
     可能只恢复当前线程，其他线程保持暂停；如果其他线程正持有日志 Handler 锁，
     当前线程调用 logger.info() 会阻塞，看起来像“卡在这一行”。
     """
-    if sys.gettrace() is None:
+    if not _is_debug_session:
         return
     try:
         logging.Handler.createLock = lambda self: None  # type: ignore[method-assign]

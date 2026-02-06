@@ -125,20 +125,19 @@ help(obj)       # 查看帮助文档
 
 ## 🆘 常见问题
 
-### Q0: VSCode 单步调试卡在 `logger.info(...)` 不动？
+### Q0: VSCode 单步调试卡住（模型加载后不往下走）？
 
-现象：从 `main()` 入口开始单步（F10/F11），在模型加载后可能卡在某一行 `logger.info(...)`，看起来“无法执行下去”。
+现象：从 `main()` 入口开始单步（F10/F11），在 `LLM(...)` 初始化完成后继续单步会“卡住”，看起来不再往下执行（有时光标停在 `logger.info(...)` 附近）。
 
-原因：vLLM 初始化会启动后台线程并打印日志；而 VSCode/debugpy 在“单步”时可能只恢复当前线程，其他线程保持暂停。若后台线程正好暂停在写日志（持有日志 Handler 的锁），当前线程再执行 `logger.info()` 会阻塞，从而卡住。
+原因：vLLM v1 默认会启用多进程引擎，主进程需要后台线程与子进程通信；而 VSCode/debugpy 单步时可能只恢复主线程/暂停通信线程，导致主进程与子进程互相等待，从而“卡住”（跟是否使用 vLLM 的 logger 关系不大）。
 
-解决：
-- 优先用 `F5`（Continue）跑到下一个断点，而不是从入口一直单步。
-- 把断点打在你关心的 vLLM 函数上（如 `vllm/__init__.py::LLM.__init__()`、`LLM.generate()`），再 `F5` 跳过去。
-- 如果已经卡住，尝试在 VSCode 的 `Threads` 视图里切换线程并继续/恢复全部线程。
-- 已在 `step1_basic_llama.py` 增加调试保护：检测到调试器时，本脚本日志写入 `my_debug_scripts/.logs/step1_basic_llama.debug.log`，避免与 vLLM 的控制台日志抢同一把 stdout/stderr 锁。
-- 已在 `step1_basic_llama.py` 增加调试保护：检测到调试器且未显式设置 `VLLM_ENABLE_V1_MULTIPROCESSING` 时，默认设为 `0`（单进程引擎），避免主进程打断点时通信线程暂停导致与子进程互相等待。
-- 已在 `.vscode/launch.json` 增加 `steppingResumesAllThreads: true`（如果你的 VSCode/Python 插件版本支持，会明显改善多线程单步体验）。
-- 已在 `.vscode/launch.json` 增加 `subProcess: true`（用于需要时把 vLLM 的子进程也纳入调试，避免“主进程暂停但子进程继续跑”）。
+最终解决方法（本仓库已配置好）：
+- 强制调试时使用单进程引擎：在 `.vscode/launch.json` 里设置 `VLLM_ENABLE_V1_MULTIPROCESSING=0`，并在 `step1_basic_llama.py` 里做了兜底设置。
+- 在 `.vscode/launch.json` 开启 `steppingResumesAllThreads: true`，减少“单步只跑主线程”的情况。
+- 修改配置后需要 **完全重启** 调试会话（`Shift+F5` 后再 `F5`），确保不会残留旧的子进程。
+
+调试建议：
+- 不要从入口一路单步；在 `LLM.__init__()` / `LLM.generate()` 等关键位置打断点后用 `F5` 跳转更稳定。
 
 ### Q1: 模型下载慢？
 
